@@ -227,9 +227,19 @@ class IaquaSystem(AqualinkSystem):
         self._parse_home_response(r)
 
     async def set_aux(self, aux: str) -> None:
+        LOGGER.info(
+            "Sending aux toggle for %s on system %s via session API",
+            aux,
+            self.serial,
+        )
         aux = IAQUA_COMMAND_SET_AUX + "_" + aux.replace("aux_", "")
         r = await self._send_session_request(aux)
         self._parse_devices_response(r)
+        LOGGER.info(
+            "Aux toggle accepted for %s on system %s via session API",
+            aux,
+            self.serial,
+        )
 
     async def set_light(self, data: Payload) -> None:
         r = await self._send_session_request(IAQUA_COMMAND_SET_LIGHT, data)
@@ -237,6 +247,11 @@ class IaquaSystem(AqualinkSystem):
 
     async def get_vsp_speed(self, slot_id: int = 1) -> Payload:
         """Get VSP speed presets and active speed for a pump slot."""
+        LOGGER.info(
+            "Fetching VSP state for system %s via session backend (slot %s)",
+            self.serial,
+            slot_id,
+        )
         r = await self._send_session_request(
             IAQUA_COMMAND_GET_VSP_SPEED, {"slot_id": str(slot_id)}
         )
@@ -244,6 +259,12 @@ class IaquaSystem(AqualinkSystem):
 
     async def set_vsp_speed(self, speed_id: int, slot_id: int = 1) -> Payload:
         """Enable a speed preset on a VSP pump slot."""
+        LOGGER.info(
+            "Setting VSP preset %s for system %s via session backend (slot %s)",
+            speed_id,
+            self.serial,
+            slot_id,
+        )
         r = await self._send_session_request(
             IAQUA_COMMAND_SET_VSP_SPEED,
             {
@@ -406,6 +427,11 @@ class IaquaSystem(AqualinkSystem):
             },
         )
         if status != 301:
+            LOGGER.warning(
+                "Unexpected WebTouch bootstrap status for system %s: %s",
+                self.serial,
+                status,
+            )
             msg = f"Unexpected WebTouch bootstrap status: {status}"
             raise AqualinkServiceException(msg)
 
@@ -421,6 +447,11 @@ class IaquaSystem(AqualinkSystem):
             headers={"Authorization": self.aqualink.id_token},
         )
         if status != 200:
+            LOGGER.warning(
+                "Unexpected WebTouch init status for system %s: %s",
+                self.serial,
+                status,
+            )
             msg = f"Unexpected WebTouch init status: {status}"
             raise AqualinkServiceException(msg)
 
@@ -465,6 +496,15 @@ class IaquaSystem(AqualinkSystem):
         if rpm is not None:
             commands.append((context.master_stb, 128, rpm))
 
+        LOGGER.info(
+            "Starting WebTouch command sequence for system %s (slot %s, preset=%s, rpm=%s, commands=%s)",
+            self.serial,
+            slot_id,
+            preset_speed_id,
+            rpm,
+            [(str(command), text) for _, command, text in commands],
+        )
+
         thread = threading.Thread(target=reader)
         thread.start()
         time.sleep(WEBTOUCH_DELAY_SECS)
@@ -486,8 +526,24 @@ class IaquaSystem(AqualinkSystem):
                 headers={"Authorization": self.aqualink.id_token},
             )
             if status != 200:
+                LOGGER.warning(
+                    "Unexpected WebTouch command status for system %s (slot %s, command=%s, text=%s): %s",
+                    self.serial,
+                    slot_id,
+                    command,
+                    text,
+                    status,
+                )
                 msg = f"Unexpected WebTouch command status: {status}"
                 raise AqualinkServiceException(msg)
+
+            LOGGER.info(
+                "WebTouch command accepted for system %s (slot %s, command=%s, text=%s)",
+                self.serial,
+                slot_id,
+                command,
+                text,
+            )
 
             time.sleep(WEBTOUCH_DELAY_SECS)
 
@@ -495,7 +551,14 @@ class IaquaSystem(AqualinkSystem):
         if errors:
             raise AqualinkServiceException(errors[0])
 
-        return self._parse_webtouch_events("".join(chunks))
+        events = self._parse_webtouch_events("".join(chunks))
+        LOGGER.info(
+            "Completed WebTouch command sequence for system %s (slot %s, events=%s)",
+            self.serial,
+            slot_id,
+            len(events),
+        )
+        return events
 
     @staticmethod
     def _extract_webtouch_speed_data(events: list[tuple[str, str]]) -> Payload:
@@ -530,6 +593,7 @@ class IaquaSystem(AqualinkSystem):
             )
 
         if not presets:
+            LOGGER.warning("WebTouch returned no VSP preset data")
             msg = "WebTouch did not return VSP preset data"
             raise AqualinkServiceException(msg)
 
@@ -557,6 +621,11 @@ class IaquaSystem(AqualinkSystem):
 
     async def get_webtouch_speed(self, slot_id: int = 1) -> Payload:
         """Get VSP speed data through the WebTouch transport."""
+        LOGGER.info(
+            "Fetching VSP state for system %s via webtouch backend (slot %s)",
+            self.serial,
+            slot_id,
+        )
         events = await asyncio.to_thread(
             self._collect_webtouch_events_sync,
             slot_id,
@@ -565,6 +634,12 @@ class IaquaSystem(AqualinkSystem):
 
     async def set_webtouch_speed(self, speed_id: int, slot_id: int = 1) -> None:
         """Activate a WebTouch VSP preset."""
+        LOGGER.info(
+            "Setting VSP preset %s for system %s via webtouch backend (slot %s)",
+            speed_id,
+            self.serial,
+            slot_id,
+        )
         await asyncio.to_thread(
             self._collect_webtouch_events_sync,
             slot_id,
@@ -573,6 +648,12 @@ class IaquaSystem(AqualinkSystem):
 
     async def set_webtouch_rpm(self, rpm: int, slot_id: int = 1) -> None:
         """Set an arbitrary RPM through the WebTouch transport."""
+        LOGGER.info(
+            "Setting RPM %s for system %s via webtouch backend (slot %s)",
+            rpm,
+            self.serial,
+            slot_id,
+        )
         await asyncio.to_thread(
             self._collect_webtouch_events_sync,
             slot_id,

@@ -128,6 +128,11 @@ class IaquaBinarySensor(IaquaSensor, AqualinkBinarySensor):
 
 class IaquaSwitch(IaquaBinarySensor, AqualinkSwitch):
     async def _toggle(self) -> None:
+        LOGGER.info(
+            "Toggling switch %s on system %s",
+            self.name,
+            self.system.serial,
+        )
         await self.system.set_switch(f"set_{self.name}")
 
     async def turn_on(self) -> None:
@@ -201,10 +206,24 @@ class IaquaPump(IaquaSwitch):
             else:
                 if data.get("vsp_speedInfo"):
                     self._speed_backend = "session"
+                    LOGGER.info(
+                        "Fetched VSP state for %s on system %s via session backend (slot %s)",
+                        self.name,
+                        self.system.serial,
+                        slot_id,
+                    )
                     return self._apply_speed_data(data)
 
         self._speed_backend = "webtouch"
-        return self._apply_speed_data(await self.system.get_webtouch_speed(slot_id))
+        rpm = self._apply_speed_data(await self.system.get_webtouch_speed(slot_id))
+        LOGGER.info(
+            "Fetched VSP state for %s on system %s via webtouch backend (slot %s, rpm=%s)",
+            self.name,
+            self.system.serial,
+            slot_id,
+            rpm,
+        )
+        return rpm
 
     async def fetch_rpm(self, slot_id: int = 1) -> int | None:
         """Alias for fetch_speed for HA-side RPM controls."""
@@ -217,6 +236,14 @@ class IaquaPump(IaquaSwitch):
                 f"speed_id must be 1-8, got {speed_id}"
             )
 
+        LOGGER.info(
+            "Setting preset %s for %s on system %s (slot %s)",
+            speed_id,
+            self.name,
+            self.system.serial,
+            slot_id,
+        )
+
         if self._speed_backend != "webtouch":
             try:
                 await self.system.set_vsp_speed(speed_id, slot_id)
@@ -227,6 +254,15 @@ class IaquaPump(IaquaSwitch):
 
         if self._speed_backend == "webtouch":
             await self.system.set_webtouch_speed(speed_id, slot_id)
+
+        LOGGER.info(
+            "Set preset %s for %s on system %s using %s backend (slot %s)",
+            speed_id,
+            self.name,
+            self.system.serial,
+            self._speed_backend,
+            slot_id,
+        )
 
         self._active_speed_id = speed_id
         if self._speed_presets:
@@ -244,9 +280,23 @@ class IaquaPump(IaquaSwitch):
                 f"rpm must be between {self.RPM_MIN} and {self.RPM_MAX}, got {rpm}"
             )
 
+        LOGGER.info(
+            "Setting RPM %s for %s on system %s via webtouch (slot %s)",
+            rpm,
+            self.name,
+            self.system.serial,
+            slot_id,
+        )
         await self.system.set_webtouch_rpm(rpm, slot_id)
         self._speed_backend = "webtouch"
         self._active_speed_rpm = rpm
+        LOGGER.info(
+            "Set RPM %s for %s on system %s via webtouch (slot %s)",
+            rpm,
+            self.name,
+            self.system.serial,
+            slot_id,
+        )
 
         if self._speed_presets:
             self._active_speed_id = None
