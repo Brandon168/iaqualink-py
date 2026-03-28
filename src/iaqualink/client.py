@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Self
@@ -94,6 +95,7 @@ class AqualinkClient:
         self,
         url: str,
         method: str = "get",
+        expected_statuses: Iterable[int] | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         if self._client is None:
@@ -102,8 +104,9 @@ class AqualinkClient:
                 limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY),
             )
 
-        headers = AQUALINK_HTTP_HEADERS
+        headers = dict(AQUALINK_HTTP_HEADERS)
         headers.update(kwargs.pop("headers", {}))
+        expected = set(expected_statuses or {httpx.codes.OK})
 
         LOGGER.debug(f"-> {method.upper()} {url} {kwargs}")
         r = await self._client.request(method, url, headers=headers, **kwargs)
@@ -115,11 +118,69 @@ class AqualinkClient:
             self._logged = False
             raise AqualinkServiceUnauthorizedException
 
-        if r.status_code != httpx.codes.OK:
+        if r.status_code not in expected:
             m = f"Unexpected response: {r.status_code} {r.reason_phrase}"
             raise AqualinkServiceException(m)
 
         return r
+
+    async def collect_stream(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        max_bytes: int = 196_608,
+        timeout: httpx.Timeout | float | None = None,
+    ) -> str:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                http2=True,
+                limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY),
+            )
+
+        request_headers = dict(AQUALINK_HTTP_HEADERS)
+        request_headers.update(headers or {})
+
+        LOGGER.debug("-> STREAM %s", url)
+        async with self._client.stream(
+            "get",
+            url,
+            headers=request_headers,
+            timeout=timeout,
+        ) as response:
+            LOGGER.debug("<- %s %s - %s", response.status_code, response.reason_phrase, url)
+
+            if response.status_code == httpx.codes.UNAUTHORIZED:
+                self._logged = False
+                raise AqualinkServiceUnauthorizedException
+
+            if response.status_code != httpx.codes.OK:
+                m = (
+                    f"Unexpected stream response: "
+                    f"{response.status_code} {response.reason_phrase}"
+                )
+                raise AqualinkServiceException(m)
+
+            collected: list[str] = []
+            total = 0
+            async for chunk in response.aiter_text():
+                if not chunk:
+                    continue
+
+                remaining = max_bytes - total
+                if remaining <= 0:
+                    break
+
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+
+                collected.append(chunk)
+                total += len(chunk)
+
+                if total >= max_bytes:
+                    break
+
+        return "".join(collected)
 
     async def _send_login_request(self) -> httpx.Response:
         data = {

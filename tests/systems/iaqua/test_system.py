@@ -136,3 +136,31 @@ class TestIaquaSystem(TestBaseSystem):
 
         with pytest.raises(AqualinkServiceUnauthorizedException):
             await self.sut._send_devices_screen_request()
+
+    def test_extract_webtouch_speed_data(self) -> None:
+        payload = self.sut._extract_webtouch_speed_data(
+            [
+                ("23", "54"),
+                ("24", "2||0||1||VSP1 Spd||ADJ"),
+                ("23", "30"),
+                ("24", "0||1||0||Pool Idle||1400"),
+                ("24", "1||0||0||Spa||2750"),
+            ]
+        )
+
+        assert payload == {
+            "vsp_speedInfo": [
+                {
+                    "speedid": "1",
+                    "speedname": "Pool Idle",
+                    "speedvalue": "1400",
+                    "enabled": "true",
+                },
+                {
+                    "speedid": "2",
+                    "speedname": "Spa",
+                    "speedvalue": "2750",
+                    "enabled": "false",
+                },
+            ]
+        }

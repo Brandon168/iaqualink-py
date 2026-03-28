@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from iaqualink.exception import AqualinkServiceException
 from iaqualink.systems.iaqua.device import (
     IAQUA_TEMP_CELSIUS_HIGH,
     IAQUA_TEMP_CELSIUS_LOW,
@@ -15,6 +16,7 @@ from iaqualink.systems.iaqua.device import (
     IaquaDevice,
     IaquaDimmableLight,
     IaquaLightSwitch,
+    IaquaPump,
     IaquaSensor,
     IaquaSwitch,
     IaquaThermostat,
@@ -29,6 +31,7 @@ from ...base_test_device import (
     TestBaseSwitch,
     TestBaseThermostat,
 )
+from ...common import async_noop, async_raises, async_returns
 
 
 class TestIaquaDevice(TestBaseDevice):
@@ -159,6 +162,121 @@ class TestIaquaAuxSwitch(TestIaquaSwitch, TestBaseSwitch):
         self.sut.data["state"] = "0"
         with patch.object(self.sut.system, "_parse_devices_response"):
             await super().test_turn_off_noop()
+
+
+class TestIaquaPump(TestIaquaSwitch):
+    def setUp(self) -> None:
+        super().setUp()
+
+        data = {
+            "name": "pool_pump",
+            "state": "1",
+        }
+        self.sut = IaquaDevice.from_data(self.system, data)
+        self.sut_class = IaquaPump
+
+    async def test_fetch_speed_session(self) -> None:
+        self.sut.system.get_vsp_speed = async_returns(
+            {
+                "vsp_speedInfo": [
+                    {
+                        "speedid": "1",
+                        "speedname": "Pool Idle",
+                        "speedvalue": "1400",
+                        "enabled": "true",
+                    }
+                ]
+            }
+        )
+
+        rpm = await self.sut.fetch_speed()
+
+        assert rpm == 1400
+        assert self.sut.speed == 1400
+        assert self.sut.speed_id == 1
+        assert self.sut.speed_presets == [
+            {
+                "speedid": "1",
+                "speedname": "Pool Idle",
+                "speedvalue": "1400",
+                "enabled": "true",
+            }
+        ]
+
+    async def test_fetch_speed_webtouch_fallback(self) -> None:
+        self.sut.system.get_vsp_speed = async_returns({})
+        self.sut.system.get_webtouch_speed = async_returns(
+            {
+                "vsp_speedInfo": [
+                    {
+                        "speedid": "1",
+                        "speedname": "Pool Idle",
+                        "speedvalue": "1400",
+                        "enabled": "true",
+                    }
+                ]
+            }
+        )
+
+        rpm = await self.sut.fetch_speed()
+
+        assert rpm == 1400
+        assert self.sut.speed == 1400
+        assert self.sut.speed_id == 1
+
+    async def test_set_speed_webtouch_fallback(self) -> None:
+        self.sut.system.set_vsp_speed = async_raises(AqualinkServiceException)
+        self.sut.system.set_webtouch_speed = AsyncMock()
+        self.sut._speed_backend = None
+        self.sut._speed_presets = [
+            {
+                "speedid": "1",
+                "speedname": "Pool Idle",
+                "speedvalue": "1400",
+                "enabled": "false",
+            }
+        ]
+
+        await self.sut.set_speed(1)
+
+        self.sut.system.set_webtouch_speed.assert_awaited_once_with(1, 1)
+        assert self.sut.speed == 1400
+        assert self.sut.speed_id == 1
+
+    async def test_set_speed_webtouch(self) -> None:
+        self.sut.system.set_webtouch_speed = AsyncMock()
+        self.sut._speed_backend = "webtouch"
+        self.sut._speed_presets = [
+            {
+                "speedid": "1",
+                "speedname": "Pool Idle",
+                "speedvalue": "1400",
+                "enabled": "false",
+            }
+        ]
+
+        await self.sut.set_speed(1)
+
+        self.sut.system.set_webtouch_speed.assert_awaited_once_with(1, 1)
+        assert self.sut.speed == 1400
+        assert self.sut.speed_id == 1
+
+    async def test_set_rpm(self) -> None:
+        self.sut.system.set_webtouch_rpm = AsyncMock()
+        self.sut._speed_presets = [
+            {
+                "speedid": "1",
+                "speedname": "Pool Idle",
+                "speedvalue": "1400",
+                "enabled": "true",
+            }
+        ]
+
+        await self.sut.set_rpm(1325)
+
+        self.sut.system.set_webtouch_rpm.assert_awaited_once_with(1325, 1)
+        assert self.sut.speed == 1325
+        assert self.sut.speed_id is None
 
 
 class TestIaquaLightSwitch(TestIaquaAuxSwitch, TestBaseLight):

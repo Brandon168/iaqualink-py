@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
+import httpx
+import json
 import logging
+import re
+import ssl
+import threading
 import time
 from typing import TYPE_CHECKING
+from http.cookiejar import CookieJar
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
+from urllib.request import (
+    HTTPSHandler,
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 from iaqualink.const import MIN_SECS_TO_REFRESH
 from iaqualink.exception import (
@@ -14,12 +31,13 @@ from iaqualink.system import AqualinkSystem
 from iaqualink.systems.iaqua.device import IaquaDevice
 
 if TYPE_CHECKING:
-    import httpx
-
     from iaqualink.client import AqualinkClient
     from iaqualink.typing import Payload
 
 IAQUA_SESSION_URL = "https://p-api.iaqualink.net/v1/mobile/session.json"
+IAQUA_WEB_SESSION_URL = "https://p-api.iaqualink.net/v2/mobile/session.json"
+IAQUA_WEBTOUCH_INIT_URL = "https://prm.iaqualink.net/v2/webtouch/init"
+IAQUA_WEBTOUCH_COMMAND_URL = "https://prm.iaqualink.net/v2/webtouch/command"
 
 IAQUA_COMMAND_GET_DEVICES = "get_devices"
 IAQUA_COMMAND_GET_HOME = "get_home"
@@ -33,9 +51,37 @@ IAQUA_COMMAND_SET_SOLAR_HEATER = "set_solar_heater"
 IAQUA_COMMAND_SET_SPA_HEATER = "set_spa_heater"
 IAQUA_COMMAND_SET_SPA_PUMP = "set_spa_pump"
 IAQUA_COMMAND_SET_TEMPS = "set_temps"
+IAQUA_COMMAND_GET_WEB = "get_web"
+IAQUA_COMMAND_GET_VSP_SPEED = "get_vsp_speedauxinfo"
+IAQUA_COMMAND_SET_VSP_SPEED = "enable_disable_pump_speedId"
 
+WEBTOUCH_SCREEN_PRESETS = "30"
+WEBTOUCH_DEVICES_COMMAND = "24"
+WEBTOUCH_HOME_COMMAND = "1"
+WEBTOUCH_PRESET_COMMAND_OFFSET = 16
+WEBTOUCH_SLOT_COMMAND_OFFSET = 18
+WEBTOUCH_STREAM_MAX_BYTES = 196_608
+WEBTOUCH_DELAY_SECS = 1
+WEBTOUCH_CONTEXT_TTL = 300
+WEBTOUCH_TIMEOUT_SECS = 30.0
+WEBTOUCH_EVENT_RE = re.compile(r"printNL\('([^']*)','([^']*)'\)")
 
 LOGGER = logging.getLogger("iaqualink")
+
+
+@dataclass(slots=True)
+class WebTouchContext:
+    action_id: str
+    server_connection: str
+    master_id: str
+    master_start: str
+    master_stb: str
+    fetched_at: float
+
+
+class WebTouchNoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
 
 
 class IaquaSystem(AqualinkSystem):
@@ -46,6 +92,7 @@ class IaquaSystem(AqualinkSystem):
 
         self.temp_unit: str = ""
         self.last_refresh: int = 0
+        self._webtouch_context: WebTouchContext | None = None
 
     def __repr__(self) -> str:
         attrs = ["name", "serial", "data"]
@@ -187,3 +234,347 @@ class IaquaSystem(AqualinkSystem):
     async def set_light(self, data: Payload) -> None:
         r = await self._send_session_request(IAQUA_COMMAND_SET_LIGHT, data)
         self._parse_devices_response(r)
+
+    async def get_vsp_speed(self, slot_id: int = 1) -> Payload:
+        """Get VSP speed presets and active speed for a pump slot."""
+        r = await self._send_session_request(
+            IAQUA_COMMAND_GET_VSP_SPEED, {"slot_id": str(slot_id)}
+        )
+        return r.json()
+
+    async def set_vsp_speed(self, speed_id: int, slot_id: int = 1) -> Payload:
+        """Enable a speed preset on a VSP pump slot."""
+        r = await self._send_session_request(
+            IAQUA_COMMAND_SET_VSP_SPEED,
+            {
+                "slot_id": str(slot_id),
+                "speed_id": str(speed_id),
+                "on_off_action": "on",
+            },
+        )
+        return r.json()
+
+    async def _send_webtouch_redirect_request(self) -> httpx.Response:
+        url = (
+            f"{IAQUA_WEB_SESSION_URL}?actionID=command"
+            f"&command={IAQUA_COMMAND_GET_WEB}&serial={self.serial}"
+        )
+        return await self.aqualink.send_request(
+            url,
+            headers={"Authorization": self.aqualink.id_token},
+            expected_statuses={httpx.codes.MOVED_PERMANENTLY},
+            follow_redirects=False,
+            timeout=WEBTOUCH_TIMEOUT_SECS,
+        )
+
+    @staticmethod
+    def _parse_webtouch_action_id(response: httpx.Response) -> str:
+        location = response.headers.get("location")
+        if not location:
+            msg = "WebTouch bootstrap did not return a redirect location"
+            raise AqualinkServiceException(msg)
+
+        query = parse_qs(urlparse(location).query)
+        action_ids = query.get("actionID")
+        if not action_ids:
+            msg = "WebTouch redirect did not include an actionID"
+            raise AqualinkServiceException(msg)
+        return action_ids[0]
+
+    async def _get_webtouch_context(
+        self, *, refresh: bool = False
+    ) -> WebTouchContext:
+        now = time.time()
+        if (
+            not refresh
+            and self._webtouch_context is not None
+            and now - self._webtouch_context.fetched_at < WEBTOUCH_CONTEXT_TTL
+        ):
+            return self._webtouch_context
+
+        redirect = await self._send_webtouch_redirect_request()
+        action_id = self._parse_webtouch_action_id(redirect)
+        response = await self.aqualink.send_request(
+            f"{IAQUA_WEBTOUCH_INIT_URL}?actionID={action_id}",
+            headers={
+                "Authorization": self.aqualink.id_token,
+                "user-agent": "Mozilla/5.0",
+            },
+            timeout=WEBTOUCH_TIMEOUT_SECS,
+        )
+        data = response.json()
+
+        required = (
+            "serverConnection",
+            "actionIdMasterId",
+            "actionIdMasterStart",
+            "actionIdMasterSTB",
+        )
+        if not all(key in data for key in required):
+            msg = f"Incomplete WebTouch init payload: {data}"
+            raise AqualinkServiceException(msg)
+
+        self._webtouch_context = WebTouchContext(
+            action_id=action_id,
+            server_connection=data["serverConnection"],
+            master_id=data["actionIdMasterId"],
+            master_start=data["actionIdMasterStart"],
+            master_stb=data["actionIdMasterSTB"],
+            fetched_at=now,
+        )
+        return self._webtouch_context
+
+    async def _send_webtouch_command(
+        self,
+        action_id: str,
+        command: int | str,
+        *,
+        text: int | str | None = None,
+    ) -> None:
+        payload: dict[str, str] = {
+            "actionID": action_id,
+            "command": str(command),
+            "dt": str(int(time.time() * 1000)),
+        }
+        if text is not None:
+            payload["text"] = str(text)
+
+        await self.aqualink.send_request(
+            IAQUA_WEBTOUCH_COMMAND_URL,
+            method="post",
+            json=payload,
+            headers={
+                "Authorization": self.aqualink.id_token,
+                "user-agent": "Mozilla/5.0",
+            },
+            timeout=WEBTOUCH_TIMEOUT_SECS,
+        )
+
+    @staticmethod
+    def _parse_webtouch_events(stream: str) -> list[tuple[str, str]]:
+        return WEBTOUCH_EVENT_RE.findall(stream)
+
+    @staticmethod
+    def _webtouch_request(
+        opener,
+        url: str,
+        *,
+        method: str = "GET",
+        data: Payload | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, str, dict[str, str]]:
+        request_headers = {"User-Agent": "Mozilla/5.0"}
+        if headers:
+            request_headers.update(headers)
+
+        body = None if data is None else json.dumps(data).encode()
+        if body is not None:
+            request_headers.setdefault("Content-Type", "application/json")
+
+        request = Request(url, data=body, headers=request_headers, method=method)
+
+        try:
+            response = opener.open(request, timeout=WEBTOUCH_TIMEOUT_SECS)
+            return response.getcode(), response.read().decode(errors="replace"), dict(
+                response.info()
+            )
+        except HTTPError as err:
+            return err.code, err.read().decode(errors="replace"), dict(err.headers)
+
+    def _collect_webtouch_events_sync(
+        self,
+        slot_id: int,
+        *,
+        preset_speed_id: int | None = None,
+        rpm: int | None = None,
+    ) -> list[tuple[str, str]]:
+        opener = build_opener(
+            HTTPSHandler(context=ssl.create_default_context()),
+            HTTPCookieProcessor(CookieJar()),
+            WebTouchNoRedirect(),
+        )
+
+        status, _, headers = self._webtouch_request(
+            opener,
+            (
+                f"{IAQUA_WEB_SESSION_URL}?actionID=command"
+                f"&command={IAQUA_COMMAND_GET_WEB}&serial={self.serial}"
+            ),
+            headers={
+                "Authorization": self.aqualink.id_token,
+                "User-Agent": "okhttp/3.14.7",
+            },
+        )
+        if status != 301:
+            msg = f"Unexpected WebTouch bootstrap status: {status}"
+            raise AqualinkServiceException(msg)
+
+        location = headers.get("Location") or headers.get("location")
+        if not location:
+            msg = "WebTouch bootstrap did not return a redirect location"
+            raise AqualinkServiceException(msg)
+
+        action_id = parse_qs(urlparse(location).query)["actionID"][0]
+        status, body, _ = self._webtouch_request(
+            opener,
+            f"{IAQUA_WEBTOUCH_INIT_URL}?actionID={action_id}",
+            headers={"Authorization": self.aqualink.id_token},
+        )
+        if status != 200:
+            msg = f"Unexpected WebTouch init status: {status}"
+            raise AqualinkServiceException(msg)
+
+        init = json.loads(body)
+        context = WebTouchContext(
+            action_id=action_id,
+            server_connection=init["serverConnection"],
+            master_id=init["actionIdMasterId"],
+            master_start=init["actionIdMasterStart"],
+            master_stb=init["actionIdMasterSTB"],
+            fetched_at=time.time(),
+        )
+
+        chunks: list[str] = []
+        errors: list[str] = []
+
+        def reader() -> None:
+            try:
+                request = Request(
+                    context.server_connection,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    method="GET",
+                )
+                response = opener.open(request, timeout=WEBTOUCH_TIMEOUT_SECS)
+                for _ in range(64):
+                    chunk = response.read(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk.decode(errors="replace"))
+            except Exception as err:  # noqa: BLE001
+                errors.append(repr(err))
+
+        commands = [
+            (context.master_start, WEBTOUCH_HOME_COMMAND, None),
+            (context.master_id, WEBTOUCH_DEVICES_COMMAND, None),
+            (context.master_id, WEBTOUCH_SLOT_COMMAND_OFFSET + slot_id, None),
+        ]
+        if preset_speed_id is not None:
+            commands.append(
+                (context.master_id, WEBTOUCH_PRESET_COMMAND_OFFSET + preset_speed_id, None)
+            )
+        if rpm is not None:
+            commands.append((context.master_stb, 128, rpm))
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        time.sleep(WEBTOUCH_DELAY_SECS)
+
+        for action, command, text in commands:
+            payload: Payload = {
+                "actionID": action,
+                "command": str(command),
+                "dt": str(int(time.time() * 1000)),
+            }
+            if text is not None:
+                payload["text"] = str(text)
+
+            status, _, _ = self._webtouch_request(
+                opener,
+                IAQUA_WEBTOUCH_COMMAND_URL,
+                method="POST",
+                data=payload,
+                headers={"Authorization": self.aqualink.id_token},
+            )
+            if status != 200:
+                msg = f"Unexpected WebTouch command status: {status}"
+                raise AqualinkServiceException(msg)
+
+            time.sleep(WEBTOUCH_DELAY_SECS)
+
+        thread.join(timeout=WEBTOUCH_TIMEOUT_SECS)
+        if errors:
+            raise AqualinkServiceException(errors[0])
+
+        return self._parse_webtouch_events("".join(chunks))
+
+    @staticmethod
+    def _extract_webtouch_speed_data(events: list[tuple[str, str]]) -> Payload:
+        screen_id = ""
+        presets: list[Payload] = []
+
+        for code, params in events:
+            if code == "23":
+                screen_id = params
+                continue
+
+            if code != "24" or screen_id != WEBTOUCH_SCREEN_PRESETS:
+                continue
+
+            parts = params.split("||")
+            if len(parts) < 5:
+                continue
+
+            try:
+                speed_id = int(parts[0]) + 1
+                speed_value = int(parts[4])
+            except ValueError:
+                continue
+
+            presets.append(
+                {
+                    "speedid": str(speed_id),
+                    "speedname": parts[3].strip(),
+                    "speedvalue": str(speed_value),
+                    "enabled": "true" if parts[1] == "1" else "false",
+                }
+            )
+
+        if not presets:
+            msg = "WebTouch did not return VSP preset data"
+            raise AqualinkServiceException(msg)
+
+        return {"vsp_speedInfo": presets}
+
+    async def _collect_webtouch_events(
+        self,
+        context: WebTouchContext,
+        commands: list[tuple[str, int | str, int | str | None]],
+    ) -> list[tuple[str, str]]:
+        stream_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._read_webtouch_stream,
+                context.server_connection,
+                WEBTOUCH_STREAM_MAX_BYTES,
+            )
+        )
+
+        await asyncio.sleep(WEBTOUCH_DELAY_SECS)
+        for action_id, command, text in commands:
+            await self._send_webtouch_command(action_id, command, text=text)
+            await asyncio.sleep(WEBTOUCH_DELAY_SECS)
+
+        return self._parse_webtouch_events(await stream_task)
+
+    async def get_webtouch_speed(self, slot_id: int = 1) -> Payload:
+        """Get VSP speed data through the WebTouch transport."""
+        events = await asyncio.to_thread(
+            self._collect_webtouch_events_sync,
+            slot_id,
+        )
+        return self._extract_webtouch_speed_data(events)
+
+    async def set_webtouch_speed(self, speed_id: int, slot_id: int = 1) -> None:
+        """Activate a WebTouch VSP preset."""
+        await asyncio.to_thread(
+            self._collect_webtouch_events_sync,
+            slot_id,
+            preset_speed_id=speed_id,
+        )
+
+    async def set_webtouch_rpm(self, rpm: int, slot_id: int = 1) -> None:
+        """Set an arbitrary RPM through the WebTouch transport."""
+        await asyncio.to_thread(
+            self._collect_webtouch_events_sync,
+            slot_id,
+            rpm=rpm,
+        )

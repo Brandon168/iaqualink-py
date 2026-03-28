@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import logging
 from enum import Enum, unique
 from typing import TYPE_CHECKING, cast
@@ -15,6 +16,7 @@ from iaqualink.device import (
 from iaqualink.exception import (
     AqualinkDeviceNotSupported,
     AqualinkInvalidParameterException,
+    AqualinkServiceException,
 )
 
 if TYPE_CHECKING:
@@ -80,7 +82,9 @@ class IaquaDevice(AqualinkDevice):
         if isinstance(data["state"], dict | list):
             raise AqualinkDeviceNotSupported(data)
 
-        if data["name"].endswith("_heater") or data["name"].endswith("_pump"):
+        if data["name"].endswith("_pump"):
+            class_ = IaquaPump
+        elif data["name"].endswith("_heater"):
             class_ = IaquaSwitch
         elif data["name"].endswith("_set_point"):
             if data["state"] == "":
@@ -133,6 +137,124 @@ class IaquaSwitch(IaquaBinarySensor, AqualinkSwitch):
     async def turn_off(self) -> None:
         if self.is_on:
             await self._toggle()
+
+
+class IaquaPump(IaquaSwitch):
+    """VSP (variable speed pump) with preset and arbitrary RPM support."""
+
+    RPM_MIN = 0
+    RPM_MAX = 4000
+    RPM_STEP = 5
+
+    def __init__(self, system: IaquaSystem, data: DeviceData):
+        super().__init__(system, data)
+        self._speed_presets: list[dict] | None = None
+        self._active_speed_id: int | None = None
+        self._active_speed_rpm: int | None = None
+        self._speed_backend: str | None = None
+
+    @property
+    def speed(self) -> int | None:
+        """Current pump speed in RPM, or None if not yet fetched."""
+        return self._active_speed_rpm
+
+    @property
+    def speed_id(self) -> int | None:
+        """Currently active speed preset ID (1-8), or None if not yet fetched."""
+        return self._active_speed_id
+
+    @property
+    def speed_presets(self) -> list[dict] | None:
+        """List of known speed presets."""
+        return self._speed_presets
+
+    @property
+    def rpm_min(self) -> int:
+        return self.RPM_MIN
+
+    @property
+    def rpm_max(self) -> int:
+        return self.RPM_MAX
+
+    @property
+    def rpm_step(self) -> int:
+        return self.RPM_STEP
+
+    def _apply_speed_data(self, data: DeviceData) -> int | None:
+        self._speed_presets = cast(list[dict], data.get("vsp_speedInfo", []))
+        self._active_speed_id = None
+        self._active_speed_rpm = None
+        for preset in self._speed_presets:
+            if preset.get("enabled") == "true":
+                self._active_speed_id = int(preset["speedid"])
+                self._active_speed_rpm = int(preset["speedvalue"])
+                break
+        return self._active_speed_rpm
+
+    async def fetch_speed(self, slot_id: int = 1) -> int | None:
+        """Fetch current speed from the best available VSP API."""
+        if self._speed_backend != "webtouch":
+            try:
+                data = await self.system.get_vsp_speed(slot_id)
+            except (AqualinkServiceException, httpx.HTTPError):
+                data = {}
+            else:
+                if data.get("vsp_speedInfo"):
+                    self._speed_backend = "session"
+                    return self._apply_speed_data(data)
+
+        self._speed_backend = "webtouch"
+        return self._apply_speed_data(await self.system.get_webtouch_speed(slot_id))
+
+    async def fetch_rpm(self, slot_id: int = 1) -> int | None:
+        """Alias for fetch_speed for HA-side RPM controls."""
+        return await self.fetch_speed(slot_id)
+
+    async def set_speed(self, speed_id: int, slot_id: int = 1) -> None:
+        """Set the active speed preset (1-8) on this pump."""
+        if speed_id < 1 or speed_id > 8:
+            raise AqualinkInvalidParameterException(
+                f"speed_id must be 1-8, got {speed_id}"
+            )
+
+        if self._speed_backend != "webtouch":
+            try:
+                await self.system.set_vsp_speed(speed_id, slot_id)
+            except (AqualinkServiceException, httpx.HTTPError):
+                self._speed_backend = "webtouch"
+            else:
+                self._speed_backend = "session"
+
+        if self._speed_backend == "webtouch":
+            await self.system.set_webtouch_speed(speed_id, slot_id)
+
+        self._active_speed_id = speed_id
+        if self._speed_presets:
+            for preset in self._speed_presets:
+                if int(preset["speedid"]) == speed_id:
+                    self._active_speed_rpm = int(preset["speedvalue"])
+                    preset["enabled"] = "true"
+                else:
+                    preset["enabled"] = "false"
+
+    async def set_rpm(self, rpm: int, slot_id: int = 1) -> None:
+        """Set an arbitrary RPM on this pump via WebTouch."""
+        if rpm < self.RPM_MIN or rpm > self.RPM_MAX:
+            raise AqualinkInvalidParameterException(
+                f"rpm must be between {self.RPM_MIN} and {self.RPM_MAX}, got {rpm}"
+            )
+
+        await self.system.set_webtouch_rpm(rpm, slot_id)
+        self._speed_backend = "webtouch"
+        self._active_speed_rpm = rpm
+
+        if self._speed_presets:
+            self._active_speed_id = None
+            for preset in self._speed_presets:
+                enabled = int(preset["speedvalue"]) == rpm
+                preset["enabled"] = "true" if enabled else "false"
+                if enabled:
+                    self._active_speed_id = int(preset["speedid"])
 
 
 class IaquaAuxSwitch(IaquaSwitch):
